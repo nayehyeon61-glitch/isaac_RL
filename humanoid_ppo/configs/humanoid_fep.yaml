@@ -1,41 +1,30 @@
 task_name: Humanoid
+num_envs: 2
 seed: 1
-num_envs: 2          # 초기 디버깅 시 낮게
-horizon: 1024
-num_mini_batch: 4
-ppo_epoch: 4
-
-gamma: 0.99
-gae_lambda: 0.95
-
-clip_param: 0.2
-value_loss_coef: 0.5
-entropy_coef: 0.005  # 약간 낮춤
-max_grad_norm: 0.5
-learning_rate: 2.0e-4  # 약간 낮춤
-
 hidden_size: 256
-
-prior_coef: 1.0
-prior_lr: 3.0e-4
-use_demos: false
-demos_path: ""
-demos_batch_size: 256
-demos_steps_per_update: 0
-
-adaptive_entropy: false
-target_entropy: -1.0
-
+horizon: 1024
+learning_rate: 3e-4
+ppo_epoch: 4
+num_mini_batch: 4
+value_loss_coef: 0.5
+entropy_coef: 0.01
+total_updates: 1000
 log_interval: 10
 eval_interval: 50
-total_updates: 1000
-headless: false            # ← 뷰어 켜기
-graphics_device_id: 0      # ← 화면 그릴 GPU 인덱스 (대개 0)
-render: true               # ← (새 옵션) 렌더링 on/off 토글
-render_interval: 1         # ← N 스텝마다 그리기 (프레임 줄이려면 2~4로)
 
-# (선택) 강제 디바이스 지정
-# sim_device: "cuda:0"
-# rl_device: "cuda:0"
-# headless: true
-# graphics_device_id: 0
+headless: false
+graphics_device_id: 0
+render: true
+render_interval: 1
+cam_follow: true
+cam_distance: 2.2   # 작을수록 더 가까움
+cam_height: 1.0
+cam_yaw_deg: 20.0
+
+wm:
+  enabled: true
+  ckpt_path: world_model_diffode.pt   # 절대/상대 경로 확인
+  dof_dim: 35
+  z_dim: 64
+  detach_z: false
+

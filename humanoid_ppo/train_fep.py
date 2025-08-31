@@ -1,34 +1,52 @@
 # train_fep.py
+# FEP-EntropyPPO + World Model feature integration
+# 사용 예: python train_fep.py --config configs/humanoid_fep.yaml
+
+import os, sys
 import argparse
 import yaml
+import random
 import numpy as np
+
+# ⚠️ import 순서: isaacgym -> isaacgymenvs -> torch
+from isaacgym import gymapi
+import isaacgymenvs
+import torch
 from tqdm import trange
 
-# ⚠️ 반드시 이 순서!
-from isaacgym import gymapi      # 1) isaacgym(gymapi) 먼저
-import isaacgymenvs              # 2) isaacgymenvs 다음
-import torch                     # 3) torch는 가장 나중
-from torch.utils.data import DataLoader, TensorDataset
-
 from tasks.make_env import make_isaac_env, extract_obs, sanitize_obs
+from tasks.make_env import set_viewer_camera_close, follow_target_each_step
 from ppo.agent import MLPActorCritic
 from ppo.rollouts_fep import PPORollouts
 from ppo.fep_ppo import FEP_PPO
 from models.policy_prior import PolicyPrior
+from models.wm_integration import WMFeatureAdapter
+
+
+def set_seed(seed: int = 42):
+    import torch.backends.cudnn as cudnn
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
 
 
 class RunningNorm:
-    """관측 러닝 정규화 (per-dimension mean/var)."""
+    """온라인 정규화 (x - mean) / sqrt(var + eps)"""
     def __init__(self, shape, eps=1e-5, device="cpu"):
         self.mean = torch.zeros(shape, device=device)
-        self.var  = torch.ones(shape, device=device)
+        self.var = torch.ones(shape, device=device)
         self.count = torch.tensor(eps, device=device)
 
     @torch.no_grad()
-    def update(self, x):
-        # x: [N, D]
+    def update(self, x: torch.Tensor):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
         batch_mean = x.mean(dim=0)
-        batch_var  = x.var(dim=0, unbiased=False)
+        batch_var = x.var(dim=0, unbiased=False)
         batch_count = torch.tensor(x.shape[0], device=x.device, dtype=x.dtype)
         delta = batch_mean - self.mean
         tot = self.count + batch_count
@@ -40,37 +58,8 @@ class RunningNorm:
         self.var = M2 / tot
         self.count = tot
 
-    def normalize(self, x):
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / torch.sqrt(self.var + 1e-6)
-
-
-def set_seed(s: int):
-    torch.manual_seed(s)
-    np.random.seed(s)
-
-
-def maybe_make_demos(cfg):
-    use = cfg.get("use_demos", False)
-    path = cfg.get("demos_path", "")
-    if not use or not path:
-        return None
-
-    if path.endswith(".pt"):
-        data = torch.load(path, map_location="cpu")
-        obs, act = data["obs"], data["act"]
-    else:
-        arr = np.load(path)
-        obs, act = torch.tensor(arr["obs"]), torch.tensor(arr["act"])
-
-    obs = obs.float()
-    act = act.float()
-    ds = TensorDataset(obs, act)
-    return DataLoader(
-        ds,
-        batch_size=int(cfg.get("demos_batch_size", 256)),
-        shuffle=True,
-        drop_last=True,
-    )
 
 
 def main():
@@ -83,14 +72,15 @@ def main():
 
     set_seed(int(cfg.get("seed", 1)))
 
-    sim_device  = cfg.get("sim_device", None)   # "cuda:0" / "cpu" / None(자동)
+    sim_device  = cfg.get("sim_device", None)
     rl_device   = cfg.get("rl_device", None)
     headless    = bool(cfg.get("headless", True))
     graphics_id = int(cfg.get("graphics_device_id", 0))
     render_enabled = bool(cfg.get("render", False))
     render_interval = int(cfg.get("render_interval", 1))
 
-    env, device, obs_dim, act_dim = make_isaac_env(
+    # ── Isaac env
+    env, device, obs_dim_raw, act_dim = make_isaac_env(
         task_name=cfg["task_name"],
         num_envs=int(cfg["num_envs"]),
         seed=int(cfg["seed"]),
@@ -99,26 +89,45 @@ def main():
         headless=headless,
         graphics_device_id=graphics_id,
     )
+    if not headless:
+        set_viewer_camera_close(env,env_index=0,distance=float(cfg.get("cam_distance",3.0)),
+                                 height=float(cfg.get("cam_height",1.2)),
+                                 yaw_deg=float(cfg.get("cam_yaw",30.0)))
+    # ── WorldModel feature 연결(옵션) — 피처추출은 actor 내부에서만 수행
+    wm_cfg = cfg.get("wm", {})
+    use_wm = bool(wm_cfg.get("enabled", False))
+    feature_extractor = None
+    final_obs_dim = obs_dim_raw
 
-    # 카메라 시점(뷰어 있을 때 한 번만)
-    viewer = getattr(env, "viewer", None)
-    gym    = getattr(env, "gym", None)
-    sim    = getattr(env, "sim", None)
-    if (viewer is not None) and (gym is not None):
-        eye = gymapi.Vec3(8.0, 8.0, 3.0)
-        at  = gymapi.Vec3(0.0, 0.0, 1.0)
-        gym.viewer_camera_look_at(viewer, None, eye, at)
+    if use_wm:
+        dof_dim = int(wm_cfg.get("dof_dim", 35))
+        z_dim   = int(wm_cfg.get("z_dim", 64))
+        ckpt    = str(wm_cfg.get("ckpt_path", "world_model_diffode.pt"))
+        detach  = bool(wm_cfg.get("detach_z", False))
 
-    ac = MLPActorCritic(obs_dim, act_dim, hidden_size=int(cfg.get("hidden_size", 256))).to(device)
-    prior = PolicyPrior(obs_dim, act_dim, hidden_size=int(cfg.get("hidden_size", 256))).to(device)
-    demos_loader = maybe_make_demos(cfg)
+        feature_extractor = WMFeatureAdapter(
+            obs_dim=obs_dim_raw,
+            dof_dim=dof_dim,
+            z_dim=z_dim,
+            wm_ckpt_path=ckpt,
+            device=device,
+            allow_grad_through_adapter=True,
+            detach_z=detach,
+        ).to(device)
+        final_obs_dim = obs_dim_raw + 2 * z_dim
+
+    # ── Agent / Prior
+    hidden_size = int(cfg.get("hidden_size", 256))
+    ac = MLPActorCritic(obs_dim_raw, act_dim, hidden_size=hidden_size,
+                    feature_extractor=feature_extractor).to(device)
+    prior = PolicyPrior(final_obs_dim, act_dim, hidden_size=hidden_size).to(device)
 
     algo = FEP_PPO(
         actor_critic=ac,
         policy_prior=prior,
         prior_coef=float(cfg.get("prior_coef", 1.0)),
         prior_lr=float(cfg.get("prior_lr", 3e-4)),
-        demos_loader=demos_loader,
+        demos_loader=None,
         demos_steps_per_update=int(cfg.get("demos_steps_per_update", 0)),
         clip_param=float(cfg.get("clip_param", 0.2)),
         ppo_epoch=int(cfg.get("ppo_epoch", 4)),
@@ -136,17 +145,17 @@ def main():
     gamma      = float(cfg.get("gamma", 0.99))
     gae_lambda = float(cfg.get("gae_lambda", 0.95))
 
-    rollouts = PPORollouts(obs_dim, act_dim, horizon, num_envs, device)
+    # ── Rollouts: 항상 '정규화된 원 관측' 차원으로 생성
+    rollouts = PPORollouts(obs_dim_raw, act_dim, horizon, num_envs, device)
 
-    # 초기 관측
+    # ── 초기 관측 (월드모델 적용 금지: raw만 저장/정규화)
     obs_raw = env.reset()
-    obs = extract_obs(obs_raw).to(device)
-    obs = sanitize_obs(obs)
-    # 러닝 정규화 준비
+    obs = sanitize_obs(extract_obs(obs_raw).to(device)).float()
     obs_rms = RunningNorm(obs.shape[-1], device=device)
     obs_rms.update(obs)
     obs_n = obs_rms.normalize(obs)
     rollouts.obs[0].copy_(obs_n)
+
     rnn_states = torch.zeros(num_envs, 1, device=device)
     masks = torch.ones(num_envs, 1, device=device)
 
@@ -157,49 +166,49 @@ def main():
     for update in trange(total_updates, desc="FEP-PPO"):
         for step in range(horizon):
             with torch.no_grad():
+                # ✅ actor 내부에서만 WMFeatureAdapter 적용됨
                 values, actions, log_probs, rnn_states = ac.act_fep(obs_n, rnn_states, masks)
 
             next_obs_raw, rewards, dones, _ = env.step(actions)
-            next_obs = extract_obs(next_obs_raw).to(device)
-            next_obs = sanitize_obs(next_obs, clip=100.0)
+            next_obs = sanitize_obs(extract_obs(next_obs_raw).to(device)).float()
 
-            # 정규화 업데이트 → 적용
             obs_rms.update(next_obs)
             next_obs_n = obs_rms.normalize(next_obs)
 
-            # 보상/마스크 세척
-            rewards = torch.nan_to_num(rewards.to(device), nan=0.0, posinf=1e6, neginf=-1e6)
+            rewards = torch.nan_to_num(rewards.to(device), nan=0.0, posinf=1e6, neginf=-1e6).float()
             masks = (~dones.bool()).float().unsqueeze(-1).to(device)
 
-            # 롤아웃에는 정규화된 관측을 저장
+            # ✅ rollouts에는 'raw 정규화 관측'만 저장 (WM feature 금지)
             rollouts.insert(next_obs_n, rnn_states, actions, log_probs, values, rewards, masks)
 
-            # 다음 스텝 입력 관측
+            if render_enabled and (step % max(1, render_interval) == 0):
+                try:
+                    env.render(mode="human")
+                except Exception:
+                    pass
+
             obs = next_obs
             obs_n = next_obs_n
 
-            # --- 렌더링: 뷰어가 있고, render 켜져 있으면 N스텝마다 그리기 ---
-            if render_enabled and (step % render_interval == 0):
-                if (viewer is not None) and (gym is not None) and (sim is not None):
-                    gym.step_graphics(sim)
-                    gym.draw_viewer(viewer, sim, True)
-                    gym.sync_frame_time(sim)
-
+        # ── bootstrap value: WM feature 포함해 크리틱에 입력해야 함
         with torch.no_grad():
-            next_value = ac.vf(obs_n).squeeze(-1)
+            x_val = ac._prep(obs_n)           # raw_norm -> [obs, z, z_next]
+            next_value = ac.vf(x_val).squeeze(-1)
+
         rollouts.compute_returns(next_value, gamma, gae_lambda)
 
         logs = algo.update(rollouts)
         rollouts.after_update()
 
-        if (update + 1) % log_interval == 0:
-            print({k: round(float(v), 4) for k, v in logs.items()})
+        if (update + 1) % log_interval == 0 and isinstance(logs, dict):
+            pretty = {k: (float(v) if hasattr(v, "item") else v) for k, v in logs.items()}
+            print(f"[Update {update+1}] {pretty}")
 
+        # ── 간단 평가
         if (update + 1) % eval_interval == 0:
             with torch.no_grad():
                 test_obs_raw = env.reset()
-                test_obs = extract_obs(test_obs_raw).to(device)
-                test_obs = sanitize_obs(test_obs)
+                test_obs = sanitize_obs(extract_obs(test_obs_raw).to(device)).float()
                 test_obs_n = obs_rms.normalize(test_obs)
 
                 test_ret = torch.zeros(num_envs, device=device)
@@ -208,8 +217,7 @@ def main():
                 for _ in range(200):
                     v, a, _, _ = ac.act_fep(test_obs_n, test_rnn, test_masks)
                     test_obs_raw, r, d, _ = env.step(a)
-                    test_obs = extract_obs(test_obs_raw).to(device)
-                    test_obs = sanitize_obs(test_obs)
+                    test_obs = sanitize_obs(extract_obs(test_obs_raw).to(device)).float()
                     test_obs_n = obs_rms.normalize(test_obs)
                     test_ret += r.to(device)
                     test_masks = (~d.bool()).float().unsqueeze(-1).to(device)
