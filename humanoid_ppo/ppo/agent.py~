@@ -1,0 +1,55 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.tanh_transformed import TanhTransform
+from torch.distributions.transformed_distribution import TransformedDistribution
+from torch.distributions.normal import Normal
+
+class MLPActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_size=256):
+        super().__init__()
+        # Actor
+        self.pi = nn.Sequential(
+            nn.Linear(obs_dim, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+        )
+        self.mu_head = nn.Linear(hidden_size, act_dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+        # Critic
+        self.vf = nn.Sequential(
+            nn.Linear(obs_dim, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def _dist(self, obs):
+        h = self.pi(obs)
+        mu = self.mu_head(h)
+        std = self.log_std.exp().clamp(min=1e-6)
+        base = Normal(mu, std)
+        # Tanh-squashed Gaussian (액션 범위가 [-1,1]인 연속제어에 안전)
+        dist = TransformedDistribution(base, [TanhTransform(cache_size=1)])
+        return dist
+
+    def act(self, obs):
+        dist = self._dist(obs)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(-1)
+        value = self.vf(obs).squeeze(-1)
+        return action, log_prob, value
+
+    def evaluate_actions(self, obs, actions):
+        dist = self._dist(obs)
+        log_prob = dist.log_prob(actions).sum(-1)
+        entropy = dist.base_dist.entropy().sum(-1)  # tanh 변환 전 기준
+        value = self.vf(obs).squeeze(-1)
+        return log_prob, entropy, value
+

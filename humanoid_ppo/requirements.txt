@@ -1,0 +1,6 @@
+torch>=2.1
+tensorboardX
+numpy
+tqdm
+pyyaml
+
